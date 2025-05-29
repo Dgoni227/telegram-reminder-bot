@@ -1,0 +1,163 @@
+import asyncio
+import aiosqlite
+from datetime import datetime, timedelta
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler,
+    ContextTypes, MessageHandler, filters, ConversationHandler
+)
+
+TOKEN = 7748819220:AAH33uqDjHSwfTaG6WJL-c0vQ-NglLR3aOM
+
+# Стейты для диалога
+WAITING_TEXT, WAITING_TIME = range(2)
+
+# ===== ФУНКЦИИ РАБОТЫ С БД =====
+
+async def init_db():
+    async with aiosqlite.connect("reminders.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                reminder_text TEXT,
+                remind_at TEXT
+            )
+        """)
+        await db.commit()
+
+async def add_reminder(user_id, text, remind_at):
+    async with aiosqlite.connect("reminders.db") as db:
+        await db.execute(
+            "INSERT INTO reminders (user_id, reminder_text, remind_at) VALUES (?, ?, ?)",
+            (user_id, text, remind_at)
+        )
+        await db.commit()
+
+async def get_user_reminders(user_id):
+    async with aiosqlite.connect("reminders.db") as db:
+        cursor = await db.execute(
+            "SELECT id, reminder_text, remind_at FROM reminders WHERE user_id = ? ORDER BY remind_at",
+            (user_id,)
+        )
+        return await cursor.fetchall()
+
+async def delete_reminder(user_id, reminder_id):
+    async with aiosqlite.connect("reminders.db") as db:
+        await db.execute(
+            "DELETE FROM reminders WHERE user_id = ? AND id = ?",
+            (user_id, reminder_id)
+        )
+        await db.commit()
+
+# ===== ОБРАБОТЧИКИ КОМАНД =====
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Привет! Я бот-напоминалка.\nИспользуй /напомни чтобы создать напоминание.")
+
+# === /напомни ===
+async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📝 Что мне напомнить?")
+    return WAITING_TEXT
+
+async def received_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["reminder_text"] = update.message.text
+    await update.message.reply_text("⏰ Через сколько минут или в формате HH:MM?")
+    return WAITING_TIME
+
+async def received_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    input_time = update.message.text
+    now = datetime.now()
+
+    try:
+        if ":" in input_time:
+            remind_at = datetime.strptime(input_time, "%H:%M")
+            remind_at = now.replace(hour=remind_at.hour, minute=remind_at.minute, second=0, microsecond=0)
+            if remind_at < now:
+                remind_at += timedelta(days=1)
+        else:
+            minutes = int(input_time)
+            remind_at = now + timedelta(minutes=minutes)
+    except Exception:
+        await update.message.reply_text("⚠️ Неверный формат времени. Попробуй снова.")
+        return WAITING_TIME
+
+    await add_reminder(update.effective_user.id, context.user_data["reminder_text"], remind_at.isoformat())
+    await update.message.reply_text(f"✅ Напоминание добавлено на {remind_at.strftime('%Y-%m-%d %H:%M')}")
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено.")
+    return ConversationHandler.END
+
+# === /список ===
+async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reminders = await get_user_reminders(update.effective_user.id)
+    if not reminders:
+        await update.message.reply_text("🔕 У тебя нет активных напоминаний.")
+        return
+
+    text = "📋 Твои напоминания:\n"
+    for rid, txt, time_str in reminders:
+        dt = datetime.fromisoformat(time_str)
+        text += f"🆔 {rid} — «{txt}» в {dt.strftime('%Y-%m-%d %H:%M')}\n"
+
+    await update.message.reply_text(text)
+
+# === /удалить ===
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("⚠️ Используй: /удалить [ID]")
+        return
+
+    reminder_id = int(args[0])
+    await delete_reminder(update.effective_user.id, reminder_id)
+    await update.message.reply_text("🗑 Напоминание удалено.")
+
+# === Фоновый процесс отправки ===
+async def reminder_loop(app):
+    while True:
+        now = datetime.now()
+        async with aiosqlite.connect("reminders.db") as db:
+            cursor = await db.execute(
+                "SELECT id, user_id, reminder_text FROM reminders WHERE remind_at <= ?",
+                (now.isoformat(),)
+            )
+            due_reminders = await cursor.fetchall()
+            for rid, user_id, text in due_reminders:
+                try:
+                    await app.bot.send_message(user_id, f"🔔 Напоминание: {text}")
+                except Exception as e:
+                    print(f"Ошибка отправки: {e}")
+                await db.execute("DELETE FROM reminders WHERE id = ?", (rid,))
+            await db.commit()
+        await asyncio.sleep(60)
+
+# === Запуск бота ===
+async def main():
+    await init_db()
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("напомни", remind_command)],
+        states={
+            WAITING_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_text)],
+            WAITING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_time)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("список", list_reminders))
+    app.add_handler(CommandHandler("удалить", delete_command))
+
+    # Запуск фонового процесса
+    asyncio.create_task(reminder_loop(app))
+
+    print("Бот запущен!")
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
